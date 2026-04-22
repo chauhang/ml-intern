@@ -22,6 +22,7 @@ from prompt_toolkit import PromptSession
 
 from agent.config import load_config
 from agent.core.agent_loop import submission_loop
+from agent.core import model_switcher
 from agent.core.session import OpType
 from agent.core.tools import ToolRouter
 from agent.utils.reliability_checks import check_training_script_save_pattern
@@ -49,39 +50,6 @@ litellm.drop_params = True
 # on every error — users don't need it, and our friendly errors cover the case.
 litellm.suppress_debug_info = True
 
-# ── Suggested models shown by `/model` (not a gate) ──────────────────────
-# Users can paste any HF model id (e.g. "MiniMaxAI/MiniMax-M2.7") or use one
-# of the `anthropic/` / `openai/` prefixes for direct API access. For HF ids,
-# append ":fastest" / ":cheapest" / ":preferred" / ":<provider>" to override
-# the default routing policy (auto = fastest with failover).
-SUGGESTED_MODELS = [
-    {"id": "anthropic/claude-opus-4-6", "label": "Claude Opus 4.6"},
-    {"id": "MiniMaxAI/MiniMax-M2.7", "label": "MiniMax M2.7"},
-    {"id": "moonshotai/Kimi-K2.6", "label": "Kimi K2.6"},
-    {"id": "zai-org/GLM-5.1", "label": "GLM 5.1"},
-]
-
-
-def _is_valid_model_id(model_id: str) -> bool:
-    """Loose format check — lets users pick any model id.
-
-    Accepts:
-      • anthropic/<model>
-      • openai/<model>
-      • <org>/<model>[:<tag>]            (HF router; tag = provider or policy)
-      • huggingface/<org>/<model>[:<tag>] (same, accepts legacy prefix)
-
-    Actual availability is verified against the HF router catalog on switch,
-    or by the provider on first call.
-    """
-    if not model_id or "/" not in model_id:
-        return False
-    # Strip :tag suffix before structural check
-    head = model_id.split(":", 1)[0]
-    parts = head.split("/")
-    return len(parts) >= 2 and all(parts)
-
-
 def _safe_get_args(arguments: dict) -> dict:
     """Safely extract args dict from arguments, handling cases where LLM passes string."""
     args = arguments.get("args", {})
@@ -89,80 +57,6 @@ def _safe_get_args(arguments: dict) -> dict:
     if isinstance(args, str):
         return {}
     return args if isinstance(args, dict) else {}
-
-
-_ROUTING_POLICIES = {"fastest", "cheapest", "preferred"}
-
-
-def _print_model_preflight(model_id: str, console) -> None:
-    """Validate a model switch against the HF router catalog and show the
-    user what they're about to use (providers, price, context, tool support).
-
-    Anthropic/OpenAI ids skip the catalog — those are direct API calls.
-    For unknown HF ids we print a red warning with fuzzy suggestions but
-    still allow the switch (the catalog might be lagging).
-    """
-    if model_id.startswith(("anthropic/", "openai/")):
-        console.print(f"[green]Model switched to {model_id}[/green]")
-        return
-
-    from agent.core import hf_router_catalog as cat
-
-    bare, _, tag = model_id.partition(":")
-    info = cat.lookup(bare)
-    if info is None:
-        console.print(
-            f"[bold red]Warning:[/bold red] '{bare}' isn't in the HF router "
-            "catalog. Switching anyway — first call may fail."
-        )
-        suggestions = cat.fuzzy_suggest(bare)
-        if suggestions:
-            console.print(f"[dim]Did you mean: {', '.join(suggestions)}[/dim]")
-        return
-
-    live = info.live_providers
-    if not live:
-        console.print(
-            f"[bold red]Warning:[/bold red] '{bare}' has no live providers "
-            "right now. First call will likely fail."
-        )
-        return
-
-    if tag and tag not in _ROUTING_POLICIES:
-        matched = [p for p in live if p.provider == tag]
-        if not matched:
-            names = ", ".join(p.provider for p in live)
-            console.print(
-                f"[bold red]Warning:[/bold red] provider '{tag}' doesn't serve "
-                f"'{bare}'. Live providers: {names}. Switching anyway."
-            )
-            return
-
-    if not info.any_supports_tools:
-        console.print(
-            f"[bold red]Warning:[/bold red] no provider for '{bare}' advertises "
-            "tool-call support. This agent relies on tool calls — expect errors."
-        )
-
-    console.print(f"[green]Model switched to {model_id}[/green]")
-    if tag in _ROUTING_POLICIES:
-        policy = tag
-    elif tag:
-        policy = f"pinned to {tag}"
-    else:
-        policy = "auto (fastest)"
-    console.print(f"  [dim]routing: {policy}[/dim]")
-    for p in live:
-        price = (
-            f"${p.input_price:g}/${p.output_price:g} per M tok"
-            if p.input_price is not None and p.output_price is not None
-            else "price n/a"
-        )
-        ctx = f"{p.context_length:,} ctx" if p.context_length else "ctx n/a"
-        tools = "tools" if p.supports_tools else "no tools"
-        console.print(
-            f"  [dim]{p.provider}: {price}, {ctx}, {tools}[/dim]"
-        )
 
 
 def _get_hf_token() -> str | None:
@@ -807,7 +701,7 @@ async def get_user_input(prompt_session: PromptSession) -> str:
 # Slash commands are defined in terminal_display
 
 
-def _handle_slash_command(
+async def _handle_slash_command(
     cmd: str,
     config,
     session_holder: list,
@@ -817,6 +711,9 @@ def _handle_slash_command(
     """
     Handle a slash command. Returns a Submission to enqueue, or None if
     the command was handled locally (caller should set turn_complete_event).
+
+    Async because ``/model`` fires a probe ping to validate the model+effort
+    combo before committing the switch.
     """
     parts = cmd.strip().split(None, 1)
     command = parts[0].lower()
@@ -843,35 +740,16 @@ def _handle_slash_command(
     if command == "/model":
         console = get_console()
         if not arg:
-            current = config.model_name if config else ""
-            console.print("[bold]Current model:[/bold]")
-            console.print(f"  {current}")
-            console.print("\n[bold]Suggested:[/bold]")
-            for m in SUGGESTED_MODELS:
-                marker = " [dim]<-- current[/dim]" if m["id"] == current else ""
-                console.print(f"  {m['id']}  [dim]({m['label']})[/dim]{marker}")
-            console.print(
-                "\n[dim]Paste any HF model id (e.g. 'MiniMaxAI/MiniMax-M2.7').\n"
-                "Add ':fastest', ':cheapest', ':preferred', or ':<provider>' to override routing.\n"
-                "Use 'anthropic/<model>' or 'openai/<model>' for direct API access.[/dim]"
-            )
+            model_switcher.print_model_listing(config, console)
             return None
-        if not _is_valid_model_id(arg):
-            console.print(f"[bold red]Invalid model id format:[/bold red] {arg}")
-            console.print(
-                "[dim]Expected:\n"
-                "  • <org>/<model>[:tag]    (HF router — paste from huggingface.co)\n"
-                "  • anthropic/<model>\n"
-                "  • openai/<model>[/dim]"
-            )
+        if not model_switcher.is_valid_model_id(arg):
+            model_switcher.print_invalid_id(arg, console)
             return None
         normalized = arg.removeprefix("huggingface/")
-        _print_model_preflight(normalized, console)
         session = session_holder[0] if session_holder else None
-        if session:
-            session.update_model(normalized)
-        else:
-            config.model_name = normalized
+        await model_switcher.probe_and_switch_model(
+            normalized, config, session, console, _get_hf_token(),
+        )
         return None
 
     if command == "/yolo":
@@ -882,14 +760,19 @@ def _handle_slash_command(
 
     if command == "/effort":
         console = get_console()
-        valid = {"minimal", "low", "medium", "high", "off"}
+        valid = {"minimal", "low", "medium", "high", "xhigh", "max", "off"}
+        session = session_holder[0] if session_holder else None
         if not arg:
             current = config.reasoning_effort or "off"
-            console.print(f"[bold]Reasoning effort:[/bold] {current}")
+            console.print(f"[bold]Reasoning effort preference:[/bold] {current}")
+            if session and session.model_effective_effort:
+                console.print("[dim]Probed per model:[/dim]")
+                for m, eff in session.model_effective_effort.items():
+                    console.print(f"  [dim]{m}: {eff or 'off'}[/dim]")
             console.print(
-                "[dim]Set with '/effort minimal|low|medium|high|off'. "
-                "Applies to models that support it (GPT-5 / o-series, Claude "
-                "extended thinking, HF reasoning models); dropped otherwise.[/dim]"
+                "[dim]Set with '/effort minimal|low|medium|high|xhigh|max|off'. "
+                "'max' and 'xhigh' are Anthropic-only; the cascade falls back "
+                "to whatever the model actually accepts.[/dim]"
             )
             return None
         level = arg.lower()
@@ -898,7 +781,16 @@ def _handle_slash_command(
             console.print(f"[dim]Expected one of: {', '.join(sorted(valid))}[/dim]")
             return None
         config.reasoning_effort = None if level == "off" else level
+        # Drop the per-model probe cache — the new preference may resolve
+        # differently. Next ``/model`` (or the retry safety net) reprobes.
+        if session is not None:
+            session.model_effective_effort.clear()
         console.print(f"[green]Reasoning effort: {level}[/green]")
+        if session is not None:
+            console.print(
+                "[dim]run /model <current> to re-probe, or send a message — "
+                "the agent adjusts automatically if the new level isn't supported.[/dim]"
+            )
         return None
 
     if command == "/status":
@@ -1083,7 +975,7 @@ async def main():
 
             # Handle slash commands
             if user_input.strip().startswith("/"):
-                sub = _handle_slash_command(
+                sub = await _handle_slash_command(
                     user_input.strip(), config, session_holder, submission_queue, submission_id
                 )
                 if sub is None:
