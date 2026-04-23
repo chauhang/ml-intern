@@ -1,0 +1,9 @@
+FROM unsloth/unsloth:latest
+
+USER root
+RUN pip install --no-cache-dir "torchao==0.16.0"
+
+# Override the default entrypoint (supervisord) so that
+# `docker run ... image script.py` actually runs the script.
+# Training output goes to stdout/stderr, visible via `docker logs`.
+ENTRYPOINT ["python"]

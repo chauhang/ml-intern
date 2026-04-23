@@ -77,13 +77,13 @@ class ContextManager:
         compact_size: float = 0.1,
         untouched_messages: int = 5,
         tool_specs: list[dict[str, Any]] | None = None,
-        prompt_file_suffix: str = "system_prompt_v3.yaml",
+        prompt_file_suffix: str = "system_prompt_v4.yaml",
         hf_token: str | None = None,
         local_mode: bool = False,
     ):
         self.system_prompt = self._load_system_prompt(
             tool_specs or [],
-            prompt_file_suffix="system_prompt_v3.yaml",
+            prompt_file_suffix="system_prompt_v4.yaml",
             hf_token=hf_token,
             local_mode=local_mode,
         )
@@ -311,15 +311,23 @@ class ContextManager:
             or hf_token
             or os.environ.get("HF_TOKEN")
         )
-        response = await acompletion(
-            model=model_name,
-            messages=messages_to_summarize,
-            max_completion_tokens=self.compact_size,
-            tools=tool_specs,
-            api_key=hf_key
-            if hf_key and model_name.startswith("huggingface/")
-            else None,
-        )
+        compact_kwargs: dict = {
+            "model": model_name,
+            "messages": messages_to_summarize,
+            "max_completion_tokens": self.compact_size,
+            "tools": tool_specs,
+        }
+        if hf_key and model_name.startswith("huggingface/"):
+            compact_kwargs["api_key"] = hf_key
+        if model_name.startswith("ollama/"):
+            actual_model = model_name.replace("ollama/", "", 1)
+            api_base = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
+            if not api_base.endswith("/v1"):
+                api_base = f"{api_base.rstrip('/')}/v1"
+            compact_kwargs["model"] = f"openai/{actual_model}"
+            compact_kwargs["api_base"] = api_base
+            compact_kwargs["api_key"] = "ollama"
+        response = await acompletion(**compact_kwargs)
         summarized_message = Message(
             role="assistant", content=response.choices[0].message.content
         )

@@ -30,6 +30,8 @@ _MAX_TOKENS_MAP: dict[str, int] = {
     "huggingface/novita/minimax/minimax-m2.1": 196_608,
     "huggingface/novita/moonshotai/kimi-k2.5": 262_144,
     "huggingface/novita/zai-org/glm-5": 200_000,
+    # Ollama (local)
+    "ollama/gemma4:e4b": 128_000,
 }
 _DEFAULT_MAX_TOKENS = 200_000
 

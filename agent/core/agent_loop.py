@@ -22,14 +22,19 @@ logger = logging.getLogger(__name__)
 ToolCall = ChatCompletionMessageToolCall
 
 
-def _resolve_hf_router_params(
+def _resolve_llm_params(
     model_name: str, session_hf_token: str | None = None
 ) -> dict:
-    """
-    Build LiteLLM kwargs for HuggingFace Router models.
+    """Build LiteLLM kwargs for provider-specific model routing.
 
-    api-inference.huggingface.co is deprecated; the new router lives at
-    router.huggingface.co/<provider>/v3/openai.  LiteLLM's built-in
+    Handles:
+    - ollama/<model>                         →  pass-through with optional api_base
+    - huggingface/<provider>/<org>/<model>   →  openai/ rewrite with HF router api_base
+    - everything else                        →  pass-through as-is
+
+    Using ollama for the local LLMs
+
+    For HuggingFace, LiteLLM's built-in
     ``huggingface/`` provider still targets the old endpoint, so we
     rewrite model names to ``openai/`` and supply the correct api_base.
 
@@ -43,6 +48,17 @@ def _resolve_hf_router_params(
          resolved from env / huggingface-cli login / cached token file.
       3. HF_TOKEN env — belt-and-suspenders fallback for CLI users.
     """
+    if model_name.startswith("ollama/"):
+        actual_model = model_name.replace("ollama/", "", 1)
+        api_base = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
+        if not api_base.endswith("/v1"):
+            api_base = f"{api_base.rstrip('/')}/v1"
+        return {
+            "model": f"openai/{actual_model}",
+            "api_base": api_base,
+            "api_key": "ollama",
+        }
+
     if not model_name.startswith("huggingface/"):
         return {"model": model_name}
 
@@ -518,7 +534,7 @@ class Handlers:
             tools = session.tool_router.get_tool_specs_for_llm()
             try:
                 # ── Call the LLM (streaming or non-streaming) ──
-                llm_params = _resolve_hf_router_params(
+                llm_params = _resolve_llm_params(
                     session.config.model_name, session.hf_token
                 )
                 if session.stream:

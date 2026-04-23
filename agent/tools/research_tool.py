@@ -216,7 +216,18 @@ RESEARCH_TOOL_SPEC = {
 def _resolve_llm_params(
     model_name: str, session_hf_token: str | None = None
 ) -> dict:
-    """Build LiteLLM kwargs, reusing the HF router logic from agent_loop."""
+    """Build LiteLLM kwargs for provider-specific model routing."""
+    if model_name.startswith("ollama/"):
+        actual_model = model_name.replace("ollama/", "", 1)
+        api_base = os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
+        if not api_base.endswith("/v1"):
+            api_base = f"{api_base.rstrip('/')}/v1"
+        return {
+            "model": f"openai/{actual_model}",
+            "api_base": api_base,
+            "api_key": "ollama",
+        }
+
     if not model_name.startswith("huggingface/"):
         return {"model": model_name}
 

@@ -30,7 +30,7 @@ from models import (
 )
 from session_manager import MAX_SESSIONS, SessionCapacityError, session_manager
 
-from agent.core.agent_loop import _resolve_hf_router_params
+from agent.core.agent_loop import _resolve_llm_params
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ async def llm_health_check() -> LLMHealthResponse:
     """
     model = session_manager.config.model_name
     try:
-        llm_params = _resolve_hf_router_params(model)
+        llm_params = _resolve_llm_params(model)
         await acompletion(
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=1,
@@ -163,7 +163,7 @@ async def generate_title(
 ) -> dict:
     """Generate a short title for a chat session based on the first user message."""
     model = session_manager.config.model_name
-    llm_params = _resolve_hf_router_params(model)
+    llm_params = _resolve_llm_params(model)
     try:
         response = await acompletion(
             messages=[

@@ -23,6 +23,7 @@ from agent.config import load_config
 from agent.core.agent_loop import submission_loop
 from agent.core.session import OpType
 from agent.core.tools import ToolRouter
+from agent.utils.ollama_utils import ensure_ollama_readiness
 from agent.utils.reliability_checks import check_training_script_save_pattern
 from agent.utils.terminal_display import (
     get_console,
@@ -54,6 +55,7 @@ SUGGESTED_MODELS = [
     {"id": "huggingface/fireworks-ai/MiniMaxAI/MiniMax-M2.5", "label": "MiniMax M2.5"},
     {"id": "huggingface/novita/moonshotai/kimi-k2.5", "label": "Kimi K2.5"},
     {"id": "huggingface/novita/zai-org/glm-5", "label": "GLM 5"},
+    {"id": "ollama/gemma4:e4b", "label": "Gemma 4 E4B (local Ollama)"},
 ]
 
 
@@ -64,16 +66,16 @@ def _is_valid_model_id(model_id: str) -> bool:
       • huggingface/<provider>/<org>/<model>  (HF router)
       • anthropic/<model>
       • openai/<model>
+      • ollama/<model>                        (local Ollama)
     Actual availability is verified by the provider when the first call
     is made; we don't want to maintain a hardcoded allowlist.
     """
     if not model_id or "/" not in model_id:
         return False
     if model_id.startswith("huggingface/"):
-        # needs provider + org + model → at least 3 slashes after the prefix
         parts = model_id.split("/")
         return len(parts) >= 4 and all(parts)
-    if model_id.startswith(("anthropic/", "openai/")):
+    if model_id.startswith(("anthropic/", "openai/", "ollama/")):
         parts = model_id.split("/", 1)
         return len(parts) == 2 and bool(parts[1])
     return False
@@ -657,12 +659,13 @@ async def get_user_input(prompt_session: PromptSession) -> str:
 # Slash commands are defined in terminal_display
 
 
-def _handle_slash_command(
+async def _handle_slash_command(
     cmd: str,
     config,
     session_holder: list,
     submission_queue: asyncio.Queue,
     submission_id: list[int],
+    prompt_session: PromptSession | None = None,
 ) -> Submission | None:
     """
     Handle a slash command. Returns a Submission to enqueue, or None if
@@ -700,7 +703,8 @@ def _handle_slash_command(
                 marker = " <-- current" if m["id"] == current else ""
                 print(f"  {m['id']}  ({m['label']}){marker}")
             print(
-                "\nPass any id, e.g. huggingface/<provider>/<org>/<model>.\n"
+                "\nPass any id, e.g. huggingface/<provider>/<org>/<model>"
+                " or ollama/<model> for local Ollama.\n"
                 "Availability is verified on first use."
             )
             return None
@@ -710,9 +714,14 @@ def _handle_slash_command(
                 "Expected one of:\n"
                 "  • huggingface/<provider>/<org>/<model>\n"
                 "  • anthropic/<model>\n"
-                "  • openai/<model>"
+                "  • openai/<model>\n"
+                "  • ollama/<model>  (local Ollama)"
             )
             return None
+        if arg.startswith("ollama/"):
+            if not await ensure_ollama_readiness(arg, prompt_session):
+                return None
+
         session = session_holder[0] if session_holder else None
         if session:
             session.update_model(arg)
@@ -749,18 +758,30 @@ async def main():
     # Create prompt session for input (needed early for token prompt)
     prompt_session = PromptSession()
 
-    # HF token — required, prompt if missing
+    # Load config early to check model name
+    config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
+    config = load_config(config_path)
+
+    # Check if Ollama is running and model is available
+    if config.model_name.startswith("ollama/"):
+        if not await ensure_ollama_readiness(config.model_name, prompt_session):
+            print("\nExiting: Local model not ready.")
+            return
+
+    # HF token — required for non-local models, prompt if missing
     hf_token = _get_hf_token()
-    if not hf_token:
+    is_local = config.model_name.startswith("ollama/")
+    if not hf_token and not is_local:
         hf_token = await _prompt_and_save_hf_token(prompt_session)
 
     # Resolve username for banner
     hf_user = None
-    try:
-        from huggingface_hub import HfApi
-        hf_user = HfApi(token=hf_token).whoami().get("name")
-    except Exception:
-        pass
+    if hf_token:
+        try:
+            from huggingface_hub import HfApi
+            hf_user = HfApi(token=hf_token).whoami().get("name")
+        except Exception:
+            pass
 
     print_banner(hf_user=hf_user)
 
@@ -772,10 +793,6 @@ async def main():
     turn_complete_event = asyncio.Event()
     turn_complete_event.set()
     ready_event = asyncio.Event()
-
-    # Start agent loop in background
-    config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
-    config = load_config(config_path)
 
     # Create tool router with local mode
     tool_router = ToolRouter(config.mcpServers, hf_token=hf_token, local_mode=True)
@@ -854,8 +871,9 @@ async def main():
 
             # Handle slash commands
             if user_input.strip().startswith("/"):
-                sub = _handle_slash_command(
-                    user_input.strip(), config, session_holder, submission_queue, submission_id
+                sub = await _handle_slash_command(
+                    user_input.strip(), config, session_holder, submission_queue, submission_id,
+                    prompt_session,
                 )
                 if sub is None:
                     # Command handled locally, loop back for input
@@ -912,19 +930,34 @@ async def headless_main(
 
     logging.basicConfig(level=logging.WARNING)
 
-    hf_token = _get_hf_token()
-    if not hf_token:
-        print("ERROR: No HF token found. Set HF_TOKEN or run `huggingface-cli login`.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"HF token loaded", file=sys.stderr)
-
     config_path = Path(__file__).parent.parent / "configs" / "main_agent_config.json"
     config = load_config(config_path)
-    config.yolo_mode = True  # Auto-approve everything in headless mode
 
     if model:
         config.model_name = model
+
+    # Check if Ollama is running and model is available
+    if config.model_name.startswith("ollama/"):
+        from agent.utils.ollama_utils import is_ollama_running, is_model_available
+
+        if not is_ollama_running():
+            print(f"ERROR: Ollama server is not reachable for local model {config.model_name}", file=sys.stderr)
+            sys.exit(1)
+        if not is_model_available(config.model_name):
+            actual = config.model_name.replace("ollama/", "", 1)
+            print(f"ERROR: Model {config.model_name} is not available. Run 'ollama pull {actual}' first.", file=sys.stderr)
+            sys.exit(1)
+
+    hf_token = _get_hf_token()
+    is_local = config.model_name.startswith("ollama/")
+    if not hf_token and not is_local:
+        print("ERROR: No HF token found. Set HF_TOKEN or run `huggingface-cli login`.", file=sys.stderr)
+        sys.exit(1)
+
+    if hf_token:
+        print("HF token loaded", file=sys.stderr)
+
+    config.yolo_mode = True  # Auto-approve everything in headless mode
 
     if max_iterations is not None:
         config.max_iterations = max_iterations
